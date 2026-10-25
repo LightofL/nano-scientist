@@ -1054,7 +1054,7 @@ async def _assemble_tex(shared: dict):
 
     body = "\n\n".join(cleaned_bodies.get(s, "")
                        for s in order if s in cleaned_bodies and s != "abstract")
-    abstract = re.sub(r"\\section\{[Aa]bstract\}\s*", "",
+    abstract = re.sub(r"\\section\{(?:[Aa]bstract|摘要)\}\s*", "",
                       cleaned_bodies.get("abstract", "Abstract not available.")).strip()
 
     if shared.get("paper_title"):
