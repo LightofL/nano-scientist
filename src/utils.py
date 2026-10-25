@@ -3,11 +3,12 @@
 import asyncio
 import json
 import os
+import random
 import re
 import subprocess
 import yaml
 from pathlib import Path
-from openai import AsyncOpenAI
+from openai import APIConnectionError, APITimeoutError, AsyncOpenAI
 from dotenv import load_dotenv
 
 try:
@@ -197,10 +198,110 @@ def get_async_client() -> AsyncOpenAI:
             "  OPENROUTER_API_KEY=sk-or-v1-your-key-here\n"
             "Get one at https://openrouter.ai/keys"
         )
+    # TokenPlan: do not let the SDK retry 429 immediately. Backoff lives in
+    # _chat_completions_create (rate_limit_exceeded retries; quota_exceeded does not).
     return AsyncOpenAI(
         base_url=_BASE_URL,
         api_key=api_key,
+        max_retries=0,
     )
+
+
+def _retry_delays() -> list[float]:
+    """Seconds to wait before each retry. TokenPlan's example is 1s, 2s, 4s."""
+    raw = os.environ.get("LLM_RETRY_BACKOFF_SECONDS", "1,2,4,8,16,32")
+    delays = []
+    for part in raw.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            delays.append(max(0.0, float(part)))
+        except ValueError:
+            continue
+    return delays or [1.0, 2.0, 4.0]
+
+
+def _http_status(exc: BaseException):
+    status = getattr(exc, "status_code", None)
+    if status is not None:
+        return status
+    response = getattr(exc, "response", None)
+    return getattr(response, "status_code", None)
+
+
+def _error_body(exc: BaseException) -> dict:
+    body = getattr(exc, "body", None)
+    return body if isinstance(body, dict) else {}
+
+
+def _error_code(exc: BaseException):
+    body = _error_body(exc)
+    err = body.get("error")
+    if isinstance(err, dict) and err.get("code"):
+        return str(err["code"])
+    code = getattr(exc, "code", None)
+    return str(code) if code else None
+
+
+def _request_id(exc: BaseException) -> str:
+    body = _error_body(exc)
+    if body.get("request_id"):
+        return str(body["request_id"])
+    response = getattr(exc, "response", None)
+    headers = getattr(response, "headers", None)
+    if headers is not None:
+        rid = headers.get("x-request-id") or headers.get("X-Request-Id")
+        if rid:
+            return str(rid)
+    return ""
+
+
+def _retryable_api_error(exc: BaseException) -> bool:
+    """TokenPlan: retry rate limits and 5xx; never retry quota_exceeded."""
+    code = _error_code(exc)
+    if code == "quota_exceeded":
+        return False
+    if code == "rate_limit_exceeded":
+        return True
+    status = _http_status(exc)
+    if status in (500, 502, 503, 504):
+        return True
+    if status == 429:
+        return True
+    return isinstance(exc, (APIConnectionError, APITimeoutError))
+
+
+def _rejects_tools(exc: BaseException) -> bool:
+    """True when the endpoint refused the tool schema, not when it rate-limited."""
+    if _retryable_api_error(exc) or _error_code(exc) == "quota_exceeded":
+        return False
+    text = str(exc).lower()
+    return "tool" in text or _http_status(exc) == 400
+
+
+async def _chat_completions_create(client: AsyncOpenAI, **kwargs):
+    delays = _retry_delays()
+    attempts = len(delays) + 1
+    last_exc: BaseException | None = None
+    for attempt in range(attempts):
+        if attempt and last_exc is not None:
+            delay = delays[attempt - 1]
+            jitter = random.uniform(0, min(0.5, delay * 0.1)) if delay > 0 else 0.0
+            wait = delay + jitter
+            print(
+                f"[llm] HTTP {_http_status(last_exc)} {_error_code(last_exc) or '-'} "
+                f"request_id={_request_id(last_exc) or '-'}; "
+                f"retry in {wait:.1f}s ({attempt + 1}/{attempts})"
+            )
+            await asyncio.sleep(wait)
+        try:
+            return await client.chat.completions.create(**kwargs)
+        except Exception as exc:
+            last_exc = exc
+            if attempt == attempts - 1 or not _retryable_api_error(exc):
+                raise
+    raise last_exc  # pragma: no cover
 
 
 async def call_llm_async(
@@ -228,10 +329,10 @@ async def call_llm_async(
         kwargs["tool_choice"] = "none"
 
     try:
-        response = await client.chat.completions.create(**kwargs)
+        response = await _chat_completions_create(client, **kwargs)
     except Exception as e:
-        if not allow_tools and ("tool_choice" in str(e).lower() or getattr(getattr(e, "response", None), "status_code", None) == 400):
-            response = await client.chat.completions.create(model=active_model, messages=messages)
+        if not allow_tools and _rejects_tools(e):
+            response = await _chat_completions_create(client, model=active_model, messages=messages)
         else:
             raise
 
@@ -293,14 +394,15 @@ async def call_llm_with_tools_async(
 
     for round_i in range(max_tool_rounds):
         try:
-            response = await client.chat.completions.create(
+            response = await _chat_completions_create(
+                client,
                 model=active_model,
                 messages=messages,
                 tools=all_tools,
                 tool_choice="auto",
             )
         except Exception as e:
-            if "tool" in str(e).lower() or getattr(getattr(e, "response", None), "status_code", None) == 400:
+            if _rejects_tools(e):
                 plain_text, plain_usage = await call_llm_async(prompt, system=system, budget_remaining=budget_remaining, model=active_model)
                 return plain_text, plain_usage
             raise
