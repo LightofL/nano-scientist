@@ -199,7 +199,7 @@ def get_async_client() -> AsyncOpenAI:
             "Get one at https://openrouter.ai/keys"
         )
     # TokenPlan: do not let the SDK retry 429 immediately. Backoff lives in
-    # _chat_completions_create (rate_limit_exceeded retries; quota_exceeded does not).
+    # _chat_completions_create, including quota_exceeded.
     return AsyncOpenAI(
         base_url=_BASE_URL,
         api_key=api_key,
@@ -258,23 +258,25 @@ def _request_id(exc: BaseException) -> str:
 
 
 def _retryable_api_error(exc: BaseException) -> bool:
-    """TokenPlan: retry rate limits and 5xx; never retry quota_exceeded."""
+    """Retry 429s and 5xx. quota_exceeded is included.
+
+    TokenPlan's docs describe that code as an empty wallet. A run also
+    received it while the wallet still had a large balance, then the next
+    small call was a model-channel rate limit. Bounded retries cover that
+    case; a hard quota failure still raises after the last attempt.
+    """
     code = _error_code(exc)
-    if code == "quota_exceeded":
-        return False
-    if code == "rate_limit_exceeded":
+    if code in ("rate_limit_exceeded", "quota_exceeded"):
         return True
     status = _http_status(exc)
-    if status in (500, 502, 503, 504):
-        return True
-    if status == 429:
+    if status in (500, 502, 503, 504, 429):
         return True
     return isinstance(exc, (APIConnectionError, APITimeoutError))
 
 
 def _rejects_tools(exc: BaseException) -> bool:
     """True when the endpoint refused the tool schema, not when it rate-limited."""
-    if _retryable_api_error(exc) or _error_code(exc) == "quota_exceeded":
+    if _retryable_api_error(exc):
         return False
     text = str(exc).lower()
     return "tool" in text or _http_status(exc) == 400
