@@ -301,7 +301,10 @@ async def _chat_completions_create(client: AsyncOpenAI, **kwargs):
             return await client.chat.completions.create(**kwargs)
         except Exception as exc:
             last_exc = exc
-            if attempt == attempts - 1 or not _retryable_api_error(exc):
+            # Each attempt already waited for the client read timeout (10 minutes).
+            # One extra try is enough; the short 429 schedule must not multiply that wait.
+            timeout_gave_up = isinstance(exc, APITimeoutError) and attempt >= 1
+            if attempt == attempts - 1 or timeout_gave_up or not _retryable_api_error(exc):
                 raise
     raise last_exc  # pragma: no cover
 

@@ -737,6 +737,13 @@ async def _quality_gate(shared: dict, stage: str, stage_goal: str) -> tuple[bool
     return False, text[:200]
 
 
+def _yield_stage(exc: BaseException) -> bool:
+    """True when the provider stall should end this stage instead of the whole run."""
+    if type(exc).__name__ in ("APITimeoutError", "APIConnectionError", "RateLimitError"):
+        return True
+    return _error_code(exc) in ("quota_exceeded", "rate_limit_exceeded")
+
+
 async def _run_loop(shared: dict, stage: str, stage_goal: str,
                     skill_filter_fn=None) -> str:
     """Run one research stage as an autonomous loop.
@@ -789,10 +796,22 @@ async def _run_loop(shared: dict, stage: str, stage_goal: str,
             if skill_name not in skill_index:
                 print(f"[{stage}] Unknown skill '{skill_name}' — skipping.")
             else:
-                await _execute_skill(skill_name, stage, shared)
+                try:
+                    await _execute_skill(skill_name, stage, shared)
+                except Exception as exc:
+                    if _yield_stage(exc):
+                        print(f"[{stage}] {skill_name} stopped: {type(exc).__name__}: {exc}")
+                        return "llm_error"
+                    raise
 
         # Quality gate after every action (including after skill execution)
-        accepted, feedback = await _quality_gate(shared, stage, stage_goal)
+        try:
+            accepted, feedback = await _quality_gate(shared, stage, stage_goal)
+        except Exception as exc:
+            if _yield_stage(exc):
+                print(f"[{stage}] quality_gate stopped: {type(exc).__name__}: {exc}")
+                return "llm_error"
+            raise
         print(f"[{stage}] quality_gate: accepted={accepted} — {feedback[:100]}")
         if accepted:
             return "goal_achieved"
