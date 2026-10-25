@@ -34,6 +34,7 @@ from .utils import (
     dedup_bibtex,
     track_cost,
     estimate_calls_remaining,
+    _error_code,
 )
 
 # ---------------------------------------------------------------------------
@@ -707,13 +708,28 @@ async def _quality_gate(shared: dict, stage: str, stage_goal: str) -> tuple[bool
         "```"
     )
     reviewer_model = os.environ.get("REVIEWER_MODEL", "").strip() or None
-    text, usage = await call_llm_async(
-        prompt,
-        system=_REVIEW_SYSTEM,
-        budget_remaining=shared.get("budget_remaining", 0),
-        cost_log=shared.get("cost_log"),
-        model=reviewer_model,
-    )
+    main_model = os.environ.get("MODEL_NAME", "").strip() or None
+    try:
+        text, usage = await call_llm_async(
+            prompt,
+            system=_REVIEW_SYSTEM,
+            budget_remaining=shared.get("budget_remaining", 0),
+            cost_log=shared.get("cost_log"),
+            model=reviewer_model,
+        )
+    except Exception as exc:
+        # Reviewer calls have failed with quota_exceeded while the main model
+        # still answers. One fallback keeps the stage loop from aborting.
+        if not (reviewer_model and main_model and main_model != reviewer_model and _error_code(exc) in ("quota_exceeded", "rate_limit_exceeded")):
+            raise
+        print(f"[{stage}] quality_gate {reviewer_model} {_error_code(exc)}; falling back to {main_model}")
+        text, usage = await call_llm_async(
+            prompt,
+            system=_REVIEW_SYSTEM,
+            budget_remaining=shared.get("budget_remaining", 0),
+            cost_log=shared.get("cost_log"),
+            model=main_model,
+        )
     track_cost(shared, f"{stage}:quality_gate", usage)
     parsed = parse_yaml_response(text)
     if isinstance(parsed, dict):
