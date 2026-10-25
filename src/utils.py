@@ -646,7 +646,8 @@ def dedup_bibtex(entries: list[str]) -> str:
                 rejected += 1
                 continue
             if key not in seen:
-                seen[key] = entry
+                # Bare & is an alignment tab in LaTeX bibliographies.
+                seen[key] = re.sub(r"(?<!\\)&", r"\\&", entry)
     if rejected:
         print(f"[dedup_bibtex] Rejected {rejected} invalid BibTeX entries")
     return "\n\n".join(seen.values()) + "\n" if seen else ""

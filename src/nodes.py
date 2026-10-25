@@ -1270,24 +1270,80 @@ class WritingLoop(AsyncNode):
 # ===========================================================================
 # 5. CompileTeX
 # ===========================================================================
+def _contains_cjk(text: str) -> bool:
+    return any("\u4e00" <= ch <= "\u9fff" for ch in text)
+
+
+def _kpsewhich(name: str) -> bool:
+    try:
+        found = subprocess.run(
+            ["kpsewhich", name],
+            capture_output=True, text=True, errors="replace", timeout=10,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return found.returncode == 0 and bool(found.stdout.strip())
+
+
+def _strip_legacy_font_setup(tex: str) -> str:
+    tex = tex.replace("\\usepackage[utf8]{inputenc}\n", "")
+    tex = tex.replace("\\usepackage[T1]{fontenc}\n", "")
+    kept = []
+    for line in tex.splitlines(keepends=True):
+        if line.startswith((
+            "\\usepackage{fontspec}",
+            "\\setmainfont{",
+            "\\setsansfont{",
+            "\\setmonofont{",
+        )):
+            continue
+        kept.append(line)
+    return "".join(kept)
+
+
+def _prepare_latex_engine(tex_path: Path) -> str:
+    """Return pdflatex, or lualatex after making a CJK draft compilable.
+
+    The default skeleton loads inputenc and T1 fontenc, which cannot draw
+    Chinese. When ctex is installed, switch that file to ctex and compile
+    it with lualatex.
+    """
+    tex = tex_path.read_text(encoding="utf-8")
+    if not _contains_cjk(tex):
+        return "pdflatex"
+    if not shutil.which("lualatex") or not _kpsewhich("ctex.sty"):
+        return "pdflatex"
+    tex = _strip_legacy_font_setup(tex)
+    if "ctex" not in tex:
+        tex = tex.replace(
+            "\\documentclass[11pt]{article}\n",
+            "\\documentclass[11pt]{article}\n\\usepackage[fontset=fandol]{ctex}\n",
+            1,
+        )
+    tex_path.write_text(tex, encoding="utf-8")
+    return "lualatex"
+
+
 class CompileTeX(Node):
     def prep(self, shared):
         return shared["output_path"]
 
     def exec(self, out_dir):
-        if not shutil.which("pdflatex"):
-            return None, "pdflatex not found", ""
+        tex_path = Path(out_dir) / "report.tex"
+        engine = _prepare_latex_engine(tex_path) if tex_path.exists() else "pdflatex"
+        if not shutil.which(engine):
+            return None, f"{engine} not found", ""
         all_output = []
         last_pdflatex = ""
-        for cmd in [["pdflatex", "-interaction=nonstopmode", "report.tex"],
+        for cmd in [[engine, "-interaction=nonstopmode", "report.tex"],
                     ["bibtex", "report"],
-                    ["pdflatex", "-interaction=nonstopmode", "report.tex"],
-                    ["pdflatex", "-interaction=nonstopmode", "report.tex"]]:
+                    [engine, "-interaction=nonstopmode", "report.tex"],
+                    [engine, "-interaction=nonstopmode", "report.tex"]]:
             r = subprocess.run(cmd, cwd=out_dir, capture_output=True,
                                text=True, errors="replace", timeout=LATEX_COMPILE_TIMEOUT)
             out = r.stdout + r.stderr
             all_output.append(out)
-            if cmd[0] == "pdflatex":
+            if cmd[0] == engine:
                 last_pdflatex = out
         success = (Path(out_dir) / "report.pdf").exists()
         return success, "\n".join(all_output), last_pdflatex
