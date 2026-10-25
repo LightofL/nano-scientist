@@ -93,6 +93,14 @@ def count_tokens(text: str) -> int:
     return int(len(text.split()) * 1.3)
 
 
+def _median(values: list[float]) -> float:
+    ordered = sorted(values)
+    mid = len(ordered) // 2
+    if len(ordered) % 2:
+        return ordered[mid]
+    return (ordered[mid - 1] + ordered[mid]) / 2
+
+
 def estimate_calls_remaining(
     budget_remaining: float,
     cost_log: list = None,
@@ -101,18 +109,34 @@ def estimate_calls_remaining(
 ) -> int:
     """Estimate how many LLM calls remain given current budget.
 
-    If cost_log is provided, derives the average cost-per-call from actual
-    observed usage rather than the hardcoded defaults.
+    Observed calls use the median cost. A single multi-round tool skill can
+    be one or two orders of magnitude above a section write or a quality-gate
+    call, and the mean of that mix makes later stages look unaffordable while
+    cash is still left. Explicit token averages are the fallback when no
+    positive observed cost exists.
     """
+    if cost_log:
+        costs = []
+        for entry in cost_log:
+            if entry.get("input_tokens", 0) <= 0:
+                continue
+            cost = float(entry.get("cost") or 0)
+            if cost <= 0:
+                cost = (
+                    entry.get("input_tokens", 0) * _IN_COST / 1_000_000
+                    + entry.get("output_tokens", 0) * _OUT_COST / 1_000_000
+                )
+            if cost > 0:
+                costs.append(cost)
+        if costs:
+            cost_per_call = _median(costs)
+            if cost_per_call <= 0:
+                return 0
+            return max(0, int(budget_remaining / cost_per_call))
     if avg_prompt_tokens is None:
         avg_prompt_tokens = _EST_AVG_PROMPT_TOKENS
     if avg_output_tokens is None:
         avg_output_tokens = _EST_AVG_OUTPUT_TOKENS
-    if cost_log:
-        real_calls = [e for e in cost_log if e.get("input_tokens", 0) > 0]
-        if real_calls:
-            avg_prompt_tokens = int(sum(e["input_tokens"] for e in real_calls) / len(real_calls))
-            avg_output_tokens = int(sum(e["output_tokens"] for e in real_calls) / len(real_calls))
     cost_per_call = (
         avg_prompt_tokens * _IN_COST / 1_000_000
         + avg_output_tokens * _OUT_COST / 1_000_000

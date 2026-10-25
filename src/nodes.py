@@ -1017,6 +1017,15 @@ comments:
     return action, major
 
 
+def _fallback_title(topic: str) -> str:
+    """Use the topic when no draft exists yet or the model did not return a title."""
+    topic = (topic or "").strip()
+    words = topic.split()
+    if len(words) > TITLE_MAX_WORDS:
+        return " ".join(words[:TITLE_MAX_WORDS])
+    return topic[:120] or "Untitled"
+
+
 async def _assemble_tex(shared: dict):
     order = FULL_PAPER_SECTIONS
     cleaned_bodies = {s: _sanitize_section_body(b) for s, b in shared.get("section_bodies", {}).items()}
@@ -1050,6 +1059,9 @@ async def _assemble_tex(shared: dict):
 
     if shared.get("paper_title"):
         title = shared["paper_title"]
+    elif not body.strip():
+        title = _fallback_title(shared.get("topic", ""))
+        shared["paper_title"] = title
     else:
         title_text, title_usage = await call_llm_async(
             f"Generate a concise academic paper title (under {TITLE_MAX_WORDS} words) "
@@ -1059,6 +1071,8 @@ async def _assemble_tex(shared: dict):
         )
         track_cost(shared, "title:generate", title_usage)
         title = title_text.strip().strip('"').strip("'")
+        if not title or len(title.split()) > TITLE_MAX_WORDS:
+            title = _fallback_title(shared.get("topic", ""))
         shared["paper_title"] = title
 
     tex = (LATEX_SKELETON
