@@ -18,10 +18,10 @@ except ImportError:
     _TIKTOKEN_AVAILABLE = False
 
 
-_MODEL: str                  = "Agents-A1"
+_MODEL: str                  = "glm-5.3-flash"
 _IN_COST: float              = 0.95
 _OUT_COST: float             = 2.55
-_BASE_URL: str               = "https://discovery-api.intern-ai.org.cn/v1"
+_BASE_URL: str               = "https://open.bigmodel.cn/api/coding/paas/v4"
 _EST_AVG_PROMPT_TOKENS: int  = 500
 _EST_AVG_OUTPUT_TOKENS: int  = 300
 _TOOL_DEFAULT_TIMEOUT: int   = 60
@@ -43,10 +43,10 @@ def init_env(env_path: str = None):
     load_dotenv(path, override=True)
     global _MODEL, _IN_COST, _OUT_COST, _BASE_URL, _EST_AVG_PROMPT_TOKENS, _EST_AVG_OUTPUT_TOKENS
     global _TOOL_DEFAULT_TIMEOUT, _TOOL_MAX_TIMEOUT, _TOOL_STDOUT_LIMIT, _TOOL_STDERR_LIMIT
-    _MODEL                 = os.environ.get("MODEL_NAME", "Agents-A1")
+    _MODEL                 = os.environ.get("MODEL_NAME", "glm-5.3-flash")
     _IN_COST               = float(os.environ.get("INPUT_TOKEN_COST_PER_MILLION", "0.95"))
     _OUT_COST              = float(os.environ.get("OUTPUT_TOKEN_COST_PER_MILLION", "2.55"))
-    _BASE_URL              = os.environ.get("INFERENCE_BASE_URL", "https://discovery-api.intern-ai.org.cn/v1")
+    _BASE_URL              = os.environ.get("INFERENCE_BASE_URL", "https://open.bigmodel.cn/api/coding/paas/v4")
     _EST_AVG_PROMPT_TOKENS = int(os.environ.get("EST_AVG_PROMPT_TOKENS", "500"))
     _EST_AVG_OUTPUT_TOKENS = int(os.environ.get("EST_AVG_OUTPUT_TOKENS", "300"))
     _TOOL_DEFAULT_TIMEOUT  = int(os.environ.get("TOOL_DEFAULT_TIMEOUT", "60"))
