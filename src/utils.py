@@ -3,7 +3,6 @@
 import asyncio
 import json
 import os
-import random
 import re
 import subprocess
 import yaml
@@ -198,28 +197,11 @@ def get_async_client() -> AsyncOpenAI:
             "  OPENROUTER_API_KEY=sk-or-v1-your-key-here\n"
             "Get one at https://openrouter.ai/keys"
         )
-    # TokenPlan: do not let the SDK retry 429 immediately. Backoff lives in
-    # _chat_completions_create, including quota_exceeded.
+    # SDK default: 2 retries, short backoff capped at 8 seconds.
     return AsyncOpenAI(
         base_url=_BASE_URL,
         api_key=api_key,
-        max_retries=0,
     )
-
-
-def _retry_delays() -> list[float]:
-    """Seconds to wait before each retry. TokenPlan's example is 1s, 2s, 4s."""
-    raw = os.environ.get("LLM_RETRY_BACKOFF_SECONDS", "1,2,4,8,16,32")
-    delays = []
-    for part in raw.split(","):
-        part = part.strip()
-        if not part:
-            continue
-        try:
-            delays.append(max(0.0, float(part)))
-        except ValueError:
-            continue
-    return delays or [1.0, 2.0, 4.0]
 
 
 def _http_status(exc: BaseException):
@@ -242,19 +224,6 @@ def _error_code(exc: BaseException):
         return str(err["code"])
     code = getattr(exc, "code", None)
     return str(code) if code else None
-
-
-def _request_id(exc: BaseException) -> str:
-    body = _error_body(exc)
-    if body.get("request_id"):
-        return str(body["request_id"])
-    response = getattr(exc, "response", None)
-    headers = getattr(response, "headers", None)
-    if headers is not None:
-        rid = headers.get("x-request-id") or headers.get("X-Request-Id")
-        if rid:
-            return str(rid)
-    return ""
 
 
 def _retryable_api_error(exc: BaseException) -> bool:
@@ -283,30 +252,7 @@ def _rejects_tools(exc: BaseException) -> bool:
 
 
 async def _chat_completions_create(client: AsyncOpenAI, **kwargs):
-    delays = _retry_delays()
-    attempts = len(delays) + 1
-    last_exc: BaseException | None = None
-    for attempt in range(attempts):
-        if attempt and last_exc is not None:
-            delay = delays[attempt - 1]
-            jitter = random.uniform(0, min(0.5, delay * 0.1)) if delay > 0 else 0.0
-            wait = delay + jitter
-            print(
-                f"[llm] HTTP {_http_status(last_exc)} {_error_code(last_exc) or '-'} "
-                f"request_id={_request_id(last_exc) or '-'}; "
-                f"retry in {wait:.1f}s ({attempt + 1}/{attempts})"
-            )
-            await asyncio.sleep(wait)
-        try:
-            return await client.chat.completions.create(**kwargs)
-        except Exception as exc:
-            last_exc = exc
-            # Each attempt already waited for the client read timeout (10 minutes).
-            # One extra try is enough; the short 429 schedule must not multiply that wait.
-            timeout_gave_up = isinstance(exc, APITimeoutError) and attempt >= 1
-            if attempt == attempts - 1 or timeout_gave_up or not _retryable_api_error(exc):
-                raise
-    raise last_exc  # pragma: no cover
+    return await client.chat.completions.create(**kwargs)
 
 
 async def call_llm_async(
