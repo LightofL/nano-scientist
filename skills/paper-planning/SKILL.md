@@ -8,6 +8,10 @@ metadata:
   tags: [core, research, writing, academic-writing, experiment-design]
 ---
 
+
+<!-- source-integrity-guardrail -->
+> **Guardrails:** Follow [`../shared-references/source-integrity.md`](../shared-references/source-integrity.md). Every literature claim carries `user_provided`, `verified`, or `unverified`. Unverified items are not evidence. Bibliographic verification is not a claim-level check. End with `## Pending verification` and `## Questions for the author`. Generated paragraphs are drafts for the author to rewrite, not ready-to-use review prose. Report counts for `verified`, `unverified`, and `user_provided`.
+
 # Paper Planning
 
 A structured approach to planning academic papers before writing begins. Covers four key activities: Story design, Experiment planning, Figure design, and Timeline management.

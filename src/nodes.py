@@ -15,15 +15,27 @@ import os
 import re
 import shutil
 import subprocess
-import urllib.error
-import urllib.parse
-import urllib.request
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
 from pocketflow import Node, AsyncNode
 
+from .source_integrity import (
+    LITERATURE_SKILLS,
+    assess_entry,
+    citation_summary,
+    ensure_output_contract,
+    format_ledger_block,
+    label_draft_section,
+    load_prompt_guardrail,
+    render_pending_document,
+    resolve_missing_citation,
+    split_cite_keys,
+    stamp_entry,
+    strip_unverified_cites,
+    cite_keys_from_entries,
+)
 from .utils import (
     call_llm_async,
     call_llm_with_tools_async,
@@ -36,54 +48,6 @@ from .utils import (
     estimate_calls_remaining,
     _error_code,
 )
-
-# ---------------------------------------------------------------------------
-# CrossRef citation lookup (free, no token required)
-# ---------------------------------------------------------------------------
-def _crossref_lookup(cite_key: str) -> str | None:
-    """Try to fetch a real BibTeX entry from CrossRef for a given cite key.
-
-    The key is used as a title query. Returns a BibTeX string on success,
-    None if nothing useful is found. Fails silently — never raises.
-    """
-    query = urllib.parse.quote(cite_key.replace("-", " ").replace("_", " "))
-    url = f"https://api.crossref.org/works?query={query}&rows=1&select=DOI,title,author,published,container-title,type"
-    try:
-        req = urllib.request.Request(url, headers={"User-Agent": "nanoscientist/1.0 (mailto:research@example.com)"})
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            data = json.loads(resp.read())
-        items = data.get("message", {}).get("items", [])
-        if not items:
-            return None
-        item = items[0]
-        doi = item.get("DOI", "")
-        titles = item.get("title", [])
-        title = titles[0] if titles else ""
-        if not title:
-            return None
-        authors_raw = item.get("author", [])
-        author_str = " and ".join(
-            f"{a.get('family', '')}, {a.get('given', '')}" for a in authors_raw if a.get("family")
-        ) or "Unknown"
-        date_parts = item.get("published", {}).get("date-parts", [[]])
-        year = str(date_parts[0][0]) if date_parts and date_parts[0] else ""
-        venue = (item.get("container-title") or [""])[0]
-        entry_type = "inproceedings" if "proceedings" in item.get("type", "") else "article"
-        venue_field = "booktitle" if entry_type == "inproceedings" else "journal"
-        bib = (
-            f"@{entry_type}{{{cite_key},\n"
-            f"  author  = {{{author_str}}},\n"
-            f"  title   = {{{title}}},\n"
-            f"  year    = {{{year}}},\n"
-            f"  {venue_field} = {{{venue}}},\n"
-        )
-        if doi:
-            bib += f"  doi     = {{{doi}}},\n"
-        bib += "}"
-        return bib
-    except Exception:
-        return None
-
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -286,75 +250,48 @@ def _data_summary(shared: dict) -> str:
     return "\n".join(lines) if found_any else ""
 
 
-def _verify_bibtex_entry(entry: str) -> bool:
-    """Check that a BibTeX entry corresponds to a real paper via CrossRef title search.
+def _write_pending_verification(shared: dict):
+    out = shared.get("output_path")
+    if not out:
+        return
+    text = render_pending_document(shared.get("citation_ledger") or {})
+    (Path(out) / "pending_verification.md").write_text(text, encoding="utf-8")
 
-    Returns True if CrossRef confirms the title exists (≥60% word overlap),
-    or if the entry already contains a DOI (trusted), or if CrossRef is unreachable.
-    Returns False only when CrossRef is reachable and returns a clearly different title.
+
+def _extend_bibtex(shared: dict, new_entries: list[str], records: dict | None = None):
+    """Keep every entry, stamp its bibliographic status, and refresh the pending list.
+
+    A failed or mismatched lookup stays ``unverified``. The original fields are
+    not replaced with a different Crossref hit, and a citation key is not
+    searched as a title. ``user_provided`` records are not rewritten.
     """
-    if re.search(r'\bdoi\s*=\s*\{[^}]+\}', entry, re.IGNORECASE):
-        return True  # DOI present — trust it
-    title_m = re.search(r'\btitle\s*=\s*\{([^}]+)\}', entry, re.IGNORECASE)
-    if not title_m:
-        return True  # can't check without title — let it through
-    title = title_m.group(1).strip()
-    query = urllib.parse.quote(title)
-    url = f"https://api.crossref.org/works?query.title={query}&rows=1&select=title"
-    try:
-        req = urllib.request.Request(url, headers={"User-Agent": "nanoscientist/1.0 (mailto:research@example.com)"})
-        with urllib.request.urlopen(req, timeout=8) as resp:
-            data = json.loads(resp.read())
-        items = data.get("message", {}).get("items", [])
-        if not items:
-            return False
-        cr_title = (items[0].get("title") or [""])[0].lower()
-        entry_words = set(re.findall(r'\w+', title.lower()))
-        cr_words = set(re.findall(r'\w+', cr_title))
-        if not entry_words:
-            return True
-        overlap = len(entry_words & cr_words) / len(entry_words)
-        return overlap >= 0.6
-    except Exception:
-        return True  # network failure — don't block real entries
-
-
-def _extend_bibtex(shared: dict, new_entries: list[str], skip_verify: bool = False):
+    records = records or {}
     existing_keys = set()
-    for e in shared.get("bibtex_entries", []):
-        m = re.match(r"@\w+\{([^,]+),", e)
-        if m:
-            existing_keys.add(m.group(1).strip())
+    for existing in shared.get("bibtex_entries", []):
+        match = re.match(r"@\w+\{([^,]+),", existing)
+        if match:
+            existing_keys.add(match.group(1).strip())
+    ledger = shared.setdefault("citation_ledger", {})
+    added: list[str] = []
     for entry in new_entries:
-        m = re.match(r"@\w+\{([^,]+),", entry)
-        if not m:
+        match = re.match(r"@\w+\{([^,]+),", entry)
+        if not match:
             continue
-        key = m.group(1).strip()
+        key = match.group(1).strip()
         if key in existing_keys:
             continue
-        if not skip_verify and not _verify_bibtex_entry(entry):
-            # Try to recover a real entry via CrossRef before giving up
-            recovered = _crossref_lookup(key)
-            if recovered:
-                print(f"[BibTeX] Recovered via CrossRef: {key}")
-                entry = recovered
-            else:
-                # Keep a stub so LaTeX doesn't warn "undefined citation"
-                title_m = re.search(r'\btitle\s*=\s*\{([^}]+)\}', entry, re.IGNORECASE)
-                title = title_m.group(1) if title_m else key
-                year_m = re.search(r'\byear\s*=\s*\{([^}]+)\}', entry, re.IGNORECASE)
-                year = year_m.group(1) if year_m else ""
-                entry = (
-                    f"@misc{{{key},\n"
-                    f"  author = {{Unknown}},\n"
-                    f"  title  = {{{title}}},\n"
-                    f"  year   = {{{year}}},\n"
-                    f"  note   = {{Citation unverified}},\n"
-                    f"}}"
-                )
-                print(f"[BibTeX] Stub entry (unverified): {key}")
+        record = records.get(key) or assess_entry(entry)
+        record = dict(record)
+        record["key"] = key
+        record["claim_checked"] = False
+        entry = stamp_entry(entry, record)
+        print(f"[BibTeX] {record.get('status')} via {record.get('method') or 'none'}: {key}")
         shared.setdefault("bibtex_entries", []).append(entry)
+        ledger[key] = record
         existing_keys.add(key)
+        added.append(entry)
+    _write_pending_verification(shared)
+    return added
 
 
 def _sanitize_section_body(body: str) -> str:
@@ -417,16 +354,18 @@ def _save_artifact(text: str, stage: str, label: str,
     if code_outputs:
         main += "\n\n## Code Output\n" + "\n".join(code_outputs)
 
+    stamped = _extend_bibtex(shared, entries)
+    if stage in ("literature", "writing", "writing_revision") or label in LITERATURE_SKILLS:
+        main = ensure_output_contract(main, shared.get("citation_ledger") or {})
     shared["artifacts"][label] = (shared["artifacts"].get(label, "") + "\n\n" + main).strip()
-    _extend_bibtex(shared, entries)
 
     out_dir = Path(shared["output_path"])
     (out_dir / "artifacts").mkdir(exist_ok=True)
     step_num = len(shared["history"]) + 1
     (out_dir / "artifacts" / f"{step_num:02d}_{stage}_{label}.md").write_text(main, encoding="utf-8")
-    if entries:
+    if stamped:
         (out_dir / "artifacts" / f"{step_num:02d}_{stage}_{label}.bib").write_text(
-            "\n\n".join(entries) + "\n", encoding="utf-8")
+            "\n\n".join(stamped) + "\n", encoding="utf-8")
 
     summary = (main[:200] + "...").replace("\n", " ") if len(main) > 200 else main[:200].replace("\n", " ")
     shared["history"].append({
@@ -557,7 +496,9 @@ def _write_system(shared: dict) -> str:
         "You are an academic writing agent."
         + lang_clause +
         " Write the assigned paper section as compilable LaTeX."
-        " Be precise, citation-backed, and follow all LaTeX rules given."
+        " Be precise and follow all LaTeX rules given."
+        " Use only verified or user-provided citations as evidence."
+        " The section is a draft for the author to rewrite, not ready-to-use review prose."
     )
 
 _REVIEW_SYSTEM = (
@@ -600,6 +541,17 @@ async def _decide_next_action(shared: dict, stage: str, stage_goal: str,
     return text, usage
 
 
+def _integrity_preamble(shared: dict, skill_name: str = "", stage: str = "") -> str:
+    """Shared source-integrity preamble for literature and writing calls."""
+    if skill_name not in LITERATURE_SKILLS and stage not in ("literature", "writing", "writing_revision"):
+        return ""
+    return (
+        "## Source integrity\n"
+        + load_prompt_guardrail(shared.get("skills_dir", "skills"))
+        + "\n\n"
+    )
+
+
 async def _execute_skill(skill_name: str, stage: str, shared: dict):
     """Load a skill and run it with or without bash tools."""
     skill_content, meta = load_skill_content(shared["skills_dir"], skill_name)
@@ -611,7 +563,8 @@ async def _execute_skill(skill_name: str, stage: str, shared: dict):
         f"## Research goal (DO NOT DEVIATE from this)\n{shared.get('research_goal', shared['topic'])}\n\n"
         f"## Topic\n{shared['topic']}\n\n"
         f"## Skill: {skill_name}\n"
-        f"## Skill instructions\n{skill_content[:SKILL_CONTENT_LIMIT]}\n\n"
+        + _integrity_preamble(shared, skill_name, stage)
+        + f"## Skill instructions\n{skill_content[:SKILL_CONTENT_LIMIT]}\n\n"
         + (f"## SPECIFIC TASK (follow exactly)\n{hint}\n\n" if hint else "")
         + f"## Working directory (ABSOLUTE): {abs_out}\n"
         f"## Already produced files (DO NOT recreate):\n{_existing_files(shared)}\n\n"
@@ -635,7 +588,9 @@ async def _execute_skill(skill_name: str, stage: str, shared: dict):
         "%%END BIBTEX%%\n\n"
         "CITATION RULES:\n"
         "- Keys MUST follow author+year format (e.g. smith2023attention).\n"
-        "- Every entry MUST have author= and title= fields.\n"
+        "- Every entry MUST have author=, title=, and year= fields.\n"
+        "- If the user supplied the record, set note={verification: user_provided} and do not add fields they did not give.\n"
+        "- Do not invent a record from memory. A title-only or failed lookup stays out of the evidence and belongs in Pending verification.\n"
         "SUMMARY RULES:\n"
         "- NEVER mention absolute file paths in the summary.\n"
         "- Refer to files by short relative name only.\n"
@@ -656,8 +611,11 @@ async def _execute_skill(skill_name: str, stage: str, shared: dict):
             salvage_text, salvage_usage = await call_llm_async(
                 f"Summarise ALL findings collected so far in this step.\n"
                 f"Step: {skill_name}\nTool outputs:\n{salvage_context}\n\n"
-                "Write 200–400 words of findings, then cite:\n"
-                "%%BEGIN BIBTEX%%\n@article{key, author={...}, title={...}, year={YYYY}}\n%%END BIBTEX%%",
+                + _integrity_preamble(shared, skill_name, stage)
+                + "Write 200–400 words of findings. Cite only records present in the tool output "
+                "or supplied by the user. Do not invent authors, years, or DOIs.\n"
+                "%%BEGIN BIBTEX%%\n@article{key, author={...}, title={...}, year={YYYY}}\n%%END BIBTEX%%\n"
+                "End with ## Pending verification and ## Questions for the author.",
                 budget_remaining=shared.get("budget_remaining", 0),
                 cost_log=shared.get("cost_log"),
             )
@@ -696,9 +654,12 @@ async def _quality_gate(shared: dict, stage: str, stage_goal: str) -> tuple[bool
             for h in shared.get("history", [])
             if h.get("stage") == stage
         ) + "\n\n"
+        f"## Citation integrity\n{format_ledger_block(shared.get('citation_ledger') or {})}\n\n"
         "Has the stage goal been sufficiently achieved?\n"
         "Be GENEROUS: if substantial content was produced (papers found, surveys written, "
         "data collected, files saved), accept even if imperfect.\n"
+        "Unverified citations are not evidence that a literature claim is supported. "
+        "Do not reject the stage only because some items are unverified: label them and let the run finish.\n"
         "NOTE: Files listed under 'data/' and 'figures/' represent real downloaded papers "
         "and generated outputs — treat their presence as evidence of completed work.\n"
         "Return YAML only:\n"
@@ -830,9 +791,11 @@ async def _run_loop(shared: dict, stage: str, stage_goal: str,
 # ---------------------------------------------------------------------------
 
 async def _write_section(section: str, shared: dict):
-    cite_keys = [m.group(1).strip()
-                 for e in shared.get("bibtex_entries", [])
-                 for m in [re.match(r"@\w+\{([^,]+),", e)] if m]
+    ledger = shared.get("citation_ledger") or {}
+    evidence_keys, pending_keys = split_cite_keys(
+        cite_keys_from_entries(shared.get("bibtex_entries", [])),
+        ledger,
+    )
     artifact_text = "\n\n".join(f"### {k}\n{v[:ARTIFACT_CONTEXT_CHARS]}"
                                 for k, v in shared.get("artifacts", {}).items())
     prior_text = ("\n\n## Prior sections\n" +
@@ -878,16 +841,22 @@ async def _write_section(section: str, shared: dict):
     text, usage = await call_llm_async(
         f"""Write the **{section}** section of a research paper as compilable LaTeX.
 {lang_instruction}
+{_integrity_preamble(shared, stage="writing")}
 ## Topic: {shared["topic"]}
 ## Artifacts
 {artifact_text}{prior_text}{figures_block}{data_block}
 
-## BibTeX keys available (use ONLY these — do NOT invent new keys or emit any BibTeX):
-{", ".join(cite_keys) or "No citations available — omit all \\cite{} commands."}
+## BibTeX keys that may support a claim (verified or user_provided only):
+{", ".join(evidence_keys) or "None. Do not use \\\\cite. Mark literature sentences with [needs source]."}
+
+## Pending keys (not evidence — do NOT \\\\cite these):
+{", ".join(pending_keys) or "None."}
 
 ## LaTeX rules
 - Output ONLY this section's LaTeX (\\section{{...}} onward). No preamble, no \\documentclass.
-- Use \\cite{{key}} ONLY from the exact keys listed above. Never fabricate a key not in that list.
+- Use \\cite{{key}} ONLY from the evidence keys above. Never fabricate a key. Never cite a pending key.
+- A literature sentence without an evidence key must contain the words [needs source].
+- This section is a draft for the author to rewrite, not ready-to-use review prose.
 - Do NOT emit any %%BEGIN BIBTEX%% block. Do NOT include \\bibliography or \\bibliographystyle.
 - Escape \\%, \\&, \\#, \\$, \\_ in text mode.
 - Underscored identifiers must appear in \\texttt{{}} or math mode.
@@ -940,7 +909,8 @@ async def _write_section(section: str, shared: dict):
             f"IMPORTANT: output the {section} section content between the markers.\n\n"
             f"## Topic: {shared['topic']}\n"
             f"## Artifacts\n{artifact_text[:ARTIFACT_CONTEXT_CHARS]}\n"
-            f"## BibTeX keys (use ONLY these, do not invent new ones): {', '.join(cite_keys) or 'None'}\n\n"
+            f"## Evidence keys (cite ONLY these): {', '.join(evidence_keys) or 'None'}\n"
+            f"## Pending keys (do not cite): {', '.join(pending_keys) or 'None'}\n\n"
             f"%%BEGIN SECTION%%\n\\section{{{section.title()}}}\n...content...\n%%END SECTION%%",
             system=_write_system(shared),
             budget_remaining=shared.get("budget_remaining", 0),
@@ -951,6 +921,9 @@ async def _write_section(section: str, shared: dict):
         retry_body = _sanitize_section_body(retry_sec_m.group(1) if retry_sec_m else retry_text)
         if len(retry_body.strip()) > len(body.strip()):
             body = retry_body
+
+    body = strip_unverified_cites(body, ledger)
+    body = label_draft_section(body)
 
     shared.setdefault("section_bodies", {})[section] = body
     if section not in shared.get("sections_written", []):
@@ -991,6 +964,11 @@ async def _writing_review_pass(shared: dict) -> tuple[str, list[dict]]:
 
 ## Available skills
 {format_skill_index(shared.get("skill_index", {}))}
+
+## Citation integrity
+{format_ledger_block(shared.get("citation_ledger") or {})}
+
+A \\cite of an unverified key, or a literature claim with no evidence key and no [needs source] marker, is a major issue (fix: rewrite). Do not ask to drop the paper because items are unverified.
 
 Flag only MAJOR issues (checklist violations, missing substance).
 Return YAML:
@@ -1084,6 +1062,7 @@ async def _assemble_tex(shared: dict):
     (out_dir / "references.bib").write_text(bib, encoding="utf-8")
     shared["tex_content"] = tex
     shared["bib_content"] = bib
+    _write_pending_verification(shared)
     print(f"[assemble_tex] report.tex assembled ({len(tex)} chars)")
 
 
@@ -1150,7 +1129,7 @@ class Initializer(Node):
             "budget_remaining": shared["budget_dollars"],
             "output_language": None,  # detected lazily on first write via LLM
             "research_goal": f"Advance understanding of: {shared['topic']}",
-            "artifacts": {}, "bibtex_entries": [], "history": [],
+            "artifacts": {}, "bibtex_entries": [], "citation_ledger": {}, "history": [],
             "sections_written": [], "section_bodies": {},
             "fix_attempts": 0, "cost_log": [],
             "is_survey": is_survey,
@@ -1171,7 +1150,9 @@ class LiteratureReviewLoop(AsyncNode):
         stage_goal = (
             f"Build a thorough literature foundation for: {shared['topic']}. "
             "Find key papers, identify research gaps, and collect structured notes "
-            "and BibTeX citations covering the state of the art."
+            "and BibTeX citations covering the state of the art. "
+            "A citation may support a claim only when its status is user_provided or verified. "
+            "Unverified items are listed, not used as evidence."
         )
         reason = await _run_loop(shared, "literature", stage_goal,
                                  lambda k: k in literature_skills)
@@ -1191,7 +1172,8 @@ class ExperimentationLoop(AsyncNode):
             stage_goal = (
                 f"Synthesise the collected literature into structured survey content for: {shared['topic']}. "
                 "Produce comparison tables, thematic groupings, quantitative summaries from paper data, "
-                "and additional figures. Do NOT run experiments or write code to generate new data."
+                "and additional figures. Do NOT run experiments or write code to generate new data. "
+                "Use only user_provided or verified sources as evidence."
             )
             reason = await _run_loop(shared, "experiment", stage_goal,
                                      lambda k: k in synthesis_skills)
@@ -1385,24 +1367,22 @@ class CompileTeX(Node):
 class FixTeX(AsyncNode):
     async def prep_async(self, shared):
         undefined = shared.get("undefined_citations", [])
-        # Attempt CrossRef lookup for undefined citations before falling back to LLM.
-        still_missing = []
+        # A DOI key can be fetched. Any other key is an unverified placeholder.
+        # The cite key is not used as a title query, and the model is not asked
+        # to invent a bibliographic record.
         if undefined:
             out_dir = Path(shared["output_path"])
-            crossref_resolved = []
+            entries = []
+            records = {}
             for key in undefined:
-                entry = _crossref_lookup(key)
-                if entry:
-                    crossref_resolved.append(entry)
-                    print(f"[FixTeX] CrossRef resolved: {key}")
-                else:
-                    still_missing.append(key)
-            if crossref_resolved:
-                _extend_bibtex(shared, crossref_resolved, skip_verify=True)
-                combined = dedup_bibtex(shared.get("bibtex_entries", []))
-                (out_dir / "references.bib").write_text(combined, encoding="utf-8")
-                shared.update({"bib_content": combined})
-                print(f"[FixTeX] CrossRef added {len(crossref_resolved)} entries; {len(still_missing)} still missing")
+                entry, record = resolve_missing_citation(key)
+                entries.append(entry)
+                records[key] = record
+                print(f"[FixTeX] {record.get('status')} via {record.get('method') or 'none'}: {key}")
+            _extend_bibtex(shared, entries, records=records)
+            combined = dedup_bibtex(shared.get("bibtex_entries", []))
+            (out_dir / "references.bib").write_text(combined, encoding="utf-8")
+            shared.update({"bib_content": combined})
 
         budget_ok = _budget_ok(shared, BUDGET_RESERVE_RATIO)
         return {
@@ -1410,8 +1390,7 @@ class FixTeX(AsyncNode):
             "bib_content":        shared.get("bib_content", ""),
             "errors":             shared.get("compile_errors", ""),
             "attempt":            shared.get("fix_attempts", 0),
-            "undefined_citations": still_missing,
-            "mode":               "citation" if still_missing else ("latex_error" if not undefined else None),
+            "mode":               None if undefined else "latex_error",
             "budget_remaining":   shared.get("budget_remaining", 0),
             "budget_ok":          budget_ok,
         }
@@ -1420,24 +1399,15 @@ class FixTeX(AsyncNode):
         if not prep_res["budget_ok"]:
             return None, {"input_tokens": 0, "output_tokens": 0, "cost": 0}
         if prep_res["mode"] is None:
-            # All undefined citations were resolved by CrossRef — nothing for LLM to do.
             return None, {"input_tokens": 0, "output_tokens": 0, "cost": 0}
-        if prep_res["mode"] == "citation":
-            prompt = (
-                f"Generate BibTeX entries for these undefined citation keys "
-                f"(CrossRef found nothing for them — only include papers you are certain exist):\n"
-                f"{', '.join(prep_res['undefined_citations'])}\n\n"
-                f"Current .bib (do NOT repeat existing entries):\n{prep_res['bib_content'][:3000]}\n\n"
-                "Return ONLY new BibTeX entries. Each MUST have: author, title, year, journal/booktitle."
-            )
-        else:
-            errors = "\n".join(l for l in prep_res["errors"].split("\n")
-                               if l.startswith("!") or "Error" in l or "Undefined" in l)[:1000]
-            prompt = (
-                f"Fix these LaTeX compilation errors. Return the COMPLETE corrected .tex file.\n\n"
-                f"Errors:\n{errors}\n\nCurrent .tex:\n{prep_res['tex_content']}\n\n"
-                "Rules: do not change \\documentclass or \\usepackage lines."
-            )
+        errors = "\n".join(l for l in prep_res["errors"].split("\n")
+                           if l.startswith("!") or "Error" in l or "Undefined" in l)[:1000]
+        prompt = (
+            f"Fix these LaTeX compilation errors. Return the COMPLETE corrected .tex file.\n\n"
+            f"Errors:\n{errors}\n\nCurrent .tex:\n{prep_res['tex_content']}\n\n"
+            "Rules: do not change \\documentclass or \\usepackage lines. "
+            "Do not invent BibTeX entries or citation keys."
+        )
         return await call_llm_async(prompt, budget_remaining=prep_res["budget_remaining"])
 
     async def post_async(self, shared, prep_res, exec_res):
@@ -1445,29 +1415,17 @@ class FixTeX(AsyncNode):
         shared["fix_attempts"] = prep_res["attempt"] + 1
         if text is None:
             if prep_res["mode"] is None:
-                # All citations resolved by CrossRef — recompile with updated .bib.
                 shared.pop("undefined_citations", None)
                 return "compile"
-            # Budget exhausted — give up.
             print("[FixTeX] Budget exhausted — stopping fixes.")
             return "done"
         track_cost(shared, f"fix_tex:{shared['fix_attempts']}", usage)
         cleaned = re.sub(r"^```\w*\n?", "", text.strip())
         cleaned = re.sub(r"\n?```$", "", cleaned)
         out_dir = Path(shared["output_path"])
-        if prep_res["mode"] == "citation":
-            _, new_entries = extract_bibtex(cleaned)
-            if new_entries:
-                combined = dedup_bibtex(shared.get("bibtex_entries", []) + new_entries)
-                (out_dir / "references.bib").write_text(combined, encoding="utf-8")
-                shared.update({"bib_content": combined,
-                               "bibtex_entries": shared.get("bibtex_entries", []) + new_entries})
-                print(f"[FixTeX] Added {len(new_entries)} BibTeX entries")
-            shared.pop("undefined_citations", None)
-        else:
-            (out_dir / "report.tex").write_text(cleaned, encoding="utf-8")
-            shared["tex_content"] = cleaned
-            print(f"[FixTeX] Applied fix (attempt {shared['fix_attempts']})")
+        (out_dir / "report.tex").write_text(cleaned, encoding="utf-8")
+        shared["tex_content"] = cleaned
+        print(f"[FixTeX] Applied fix (attempt {shared['fix_attempts']})")
         return "compile"
 
 
@@ -1478,6 +1436,8 @@ class Finisher(Node):
     def post(self, shared, prep_res, exec_res):
         total = sum(e["cost"] for e in shared.get("cost_log", []))
         out_dir = Path(shared["output_path"])
+        integrity = citation_summary(shared.get("citation_ledger") or {})
+        _write_pending_verification(shared)
         (out_dir / "cost_log.json").write_text(
             json.dumps(shared.get("cost_log", []), indent=2, ensure_ascii=False), encoding="utf-8")
         (out_dir / "summary.json").write_text(
@@ -1489,10 +1449,17 @@ class Finisher(Node):
                 "steps_executed":   len(shared.get("history", [])),
                 "artifacts":        list(shared.get("artifacts", {}).keys()),
                 "bibtex_count":     len(shared.get("bibtex_entries", [])),
+                "citation_integrity": integrity,
                 "fix_attempts":     shared.get("fix_attempts", 0),
                 "completed_at":     datetime.now(timezone.utc).isoformat(),
             }, indent=2, ensure_ascii=False), encoding="utf-8")
         print(f"\n{'='*50}")
         print(f"Done! Total: ${total:.4f} / ${shared['budget_dollars']:.2f}")
+        print(
+            "Citations: "
+            f"verified={integrity['verified']} "
+            f"unverified={integrity['unverified']} "
+            f"user_provided={integrity['user_provided']}"
+        )
         print(f"Output: {shared['output_path']}/")
         print(f"{'='*50}")
