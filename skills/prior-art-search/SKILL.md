@@ -5,6 +5,10 @@ argument-hint: [invention-description-or-path]
 allowed-tools: Bash(*), Read, Glob, Grep, WebSearch, WebFetch, Write, Agent
 ---
 
+
+<!-- source-integrity-guardrail -->
+> **Guardrails:** Follow [`../shared-references/source-integrity.md`](../shared-references/source-integrity.md). Every literature claim carries `user_provided`, `verified`, or `unverified`. Unverified items are not evidence. Bibliographic verification is not a claim-level check. End with `## Pending verification` and `## Questions for the author`. Generated paragraphs are drafts for the author to rewrite, not ready-to-use review prose. Report counts for `verified`, `unverified`, and `user_provided`.
+
 # Prior Art Search
 
 Search patents and literature for prior art relevant to: **$ARGUMENTS**

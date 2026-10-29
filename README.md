@@ -42,8 +42,8 @@ Built on [PocketFlow](https://github.com/The-Pocket/PocketFlow) · Inspired by [
 | **Budget-first control** | Fix a dollar limit; the agent adapts depth and report type automatically. Loops exit the moment estimated remaining calls fall too low — no wasted spend. |
 | **Four autonomous loops** | Literature → Experimentation → Writing → Compiling — each self-terminating on quality gate or budget exhaustion. No central planner. |
 | **87 modular skills** | From paper search and code generation to grant proposals, patent drafting, and adversarial review. Lazy-loaded; each skill is one `SKILL.md` file. |
-| **Research-to-PDF pipeline** | Produces LaTeX source, deduplicated BibTeX (CrossRef-verified), per-skill artifact files, figures, scripts, and a compiled PDF — all in one run. |
-| **Zero-drop citations** | Entries failing CrossRef verification are recovered via title lookup or kept as `@misc` stubs — never silently dropped. |
+| **Research-to-PDF pipeline** | Produces LaTeX source, deduplicated BibTeX (each entry labeled `verified`, `user_provided`, or `unverified`), per-skill artifact files, figures, scripts, and a compiled PDF — all in one run. |
+| **Labeled citations** | Entries that fail a bibliographic check stay in the bibliography as `unverified` and are listed in `pending_verification.md`. They are not dropped, and they are not used as evidence. |
 
 ---
 
@@ -144,7 +144,8 @@ outputs/
     ├── traj.txt           # full stdout trace
     ├── history.json       # step-by-step execution log
     ├── cost_log.json      # per-step token costs
-    └── summary.json       # final run summary
+    ├── summary.json       # final run summary, including citation counts
+    └── pending_verification.md  # unverified and unchecked items; does not block the PDF
 ```
 
 ---
@@ -351,6 +352,7 @@ nano-scientist/
 ├── src/
 │   ├── flow.py          # PocketFlow wiring (3 loops + compile/fix)
 │   ├── nodes.py         # 7 nodes + helpers
+│   ├── source_integrity.py  # bibliographic status for literature claims
 │   └── utils.py         # LLM client, cost tracking, BibTeX utils
 ├── skills/              # 87 modular research skills
 │   ├── skills.json      # skill index (id + description)
@@ -361,6 +363,10 @@ nano-scientist/
 ```
 
 ---
+
+## Limitations
+
+Source integrity is a process constraint, not a guarantee. Literature claims are tagged `user_provided`, `verified`, or `unverified` (`skills/shared-references/source-integrity.md`). Unverified items remain in the bibliography and in `pending_verification.md`, and the writing loop will not cite them as evidence, but the run still writes a PDF. There is no evaluation of whether these labels improve a review. Crossref and OpenAlex coverage of Chinese literature is incomplete: for CNKI, Wanfang, and VIP the agent asks you to search and paste the record instead of inventing metadata. A `verified` label means the title, author family, and year matched a lookup. It does not mean the cited paper supports the sentence.
 
 ## 🤝 Join the Community
 

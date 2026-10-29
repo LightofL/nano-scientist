@@ -5,6 +5,10 @@ argument-hint: [topic-or-scope]
 allowed-tools: Bash(*), Read, Grep, Glob, Write, Edit, Agent, mcp__codex__codex, mcp__codex__codex-reply
 ---
 
+
+<!-- source-integrity-guardrail -->
+> **Guardrails:** Follow [`../shared-references/source-integrity.md`](../shared-references/source-integrity.md). Every literature claim carries `user_provided`, `verified`, or `unverified`. Unverified items are not evidence. Bibliographic verification is not a claim-level check. End with `## Pending verification` and `## Questions for the author`. Generated paragraphs are drafts for the author to rewrite, not ready-to-use review prose. Report counts for `verified`, `unverified`, and `user_provided`.
+
 # Research Review via Codex MCP (xhigh reasoning)
 
 Get a multi-round critical review of research work from an external LLM with maximum reasoning depth.
