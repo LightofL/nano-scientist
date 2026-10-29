@@ -34,6 +34,7 @@ from .utils import (
     dedup_bibtex,
     track_cost,
     estimate_calls_remaining,
+    _error_code,
 )
 
 # ---------------------------------------------------------------------------
@@ -707,18 +708,40 @@ async def _quality_gate(shared: dict, stage: str, stage_goal: str) -> tuple[bool
         "```"
     )
     reviewer_model = os.environ.get("REVIEWER_MODEL", "").strip() or None
-    text, usage = await call_llm_async(
-        prompt,
-        system=_REVIEW_SYSTEM,
-        budget_remaining=shared.get("budget_remaining", 0),
-        cost_log=shared.get("cost_log"),
-        model=reviewer_model,
-    )
+    main_model = os.environ.get("MODEL_NAME", "").strip() or None
+    try:
+        text, usage = await call_llm_async(
+            prompt,
+            system=_REVIEW_SYSTEM,
+            budget_remaining=shared.get("budget_remaining", 0),
+            cost_log=shared.get("cost_log"),
+            model=reviewer_model,
+        )
+    except Exception as exc:
+        # Reviewer calls have failed with quota_exceeded while the main model
+        # still answers. One fallback keeps the stage loop from aborting.
+        if not (reviewer_model and main_model and main_model != reviewer_model and _error_code(exc) in ("quota_exceeded", "rate_limit_exceeded")):
+            raise
+        print(f"[{stage}] quality_gate {reviewer_model} {_error_code(exc)}; falling back to {main_model}")
+        text, usage = await call_llm_async(
+            prompt,
+            system=_REVIEW_SYSTEM,
+            budget_remaining=shared.get("budget_remaining", 0),
+            cost_log=shared.get("cost_log"),
+            model=main_model,
+        )
     track_cost(shared, f"{stage}:quality_gate", usage)
     parsed = parse_yaml_response(text)
     if isinstance(parsed, dict):
         return bool(parsed.get("accepted", False)), str(parsed.get("feedback", ""))
     return False, text[:200]
+
+
+def _yield_stage(exc: BaseException) -> bool:
+    """True when the provider stall should end this stage instead of the whole run."""
+    if type(exc).__name__ in ("APITimeoutError", "APIConnectionError", "RateLimitError"):
+        return True
+    return _error_code(exc) in ("quota_exceeded", "rate_limit_exceeded")
 
 
 async def _run_loop(shared: dict, stage: str, stage_goal: str,
@@ -773,10 +796,22 @@ async def _run_loop(shared: dict, stage: str, stage_goal: str,
             if skill_name not in skill_index:
                 print(f"[{stage}] Unknown skill '{skill_name}' — skipping.")
             else:
-                await _execute_skill(skill_name, stage, shared)
+                try:
+                    await _execute_skill(skill_name, stage, shared)
+                except Exception as exc:
+                    if _yield_stage(exc):
+                        print(f"[{stage}] {skill_name} stopped: {type(exc).__name__}: {exc}")
+                        return "llm_error"
+                    raise
 
         # Quality gate after every action (including after skill execution)
-        accepted, feedback = await _quality_gate(shared, stage, stage_goal)
+        try:
+            accepted, feedback = await _quality_gate(shared, stage, stage_goal)
+        except Exception as exc:
+            if _yield_stage(exc):
+                print(f"[{stage}] quality_gate stopped: {type(exc).__name__}: {exc}")
+                return "llm_error"
+            raise
         print(f"[{stage}] quality_gate: accepted={accepted} — {feedback[:100]}")
         if accepted:
             return "goal_achieved"
@@ -982,6 +1017,15 @@ comments:
     return action, major
 
 
+def _fallback_title(topic: str) -> str:
+    """Use the topic when no draft exists yet or the model did not return a title."""
+    topic = (topic or "").strip()
+    words = topic.split()
+    if len(words) > TITLE_MAX_WORDS:
+        return " ".join(words[:TITLE_MAX_WORDS])
+    return topic[:120] or "Untitled"
+
+
 async def _assemble_tex(shared: dict):
     order = FULL_PAPER_SECTIONS
     cleaned_bodies = {s: _sanitize_section_body(b) for s, b in shared.get("section_bodies", {}).items()}
@@ -1010,11 +1054,14 @@ async def _assemble_tex(shared: dict):
 
     body = "\n\n".join(cleaned_bodies.get(s, "")
                        for s in order if s in cleaned_bodies and s != "abstract")
-    abstract = re.sub(r"\\section\{[Aa]bstract\}\s*", "",
+    abstract = re.sub(r"\\section\{(?:[Aa]bstract|摘要)\}\s*", "",
                       cleaned_bodies.get("abstract", "Abstract not available.")).strip()
 
     if shared.get("paper_title"):
         title = shared["paper_title"]
+    elif not body.strip():
+        title = _fallback_title(shared.get("topic", ""))
+        shared["paper_title"] = title
     else:
         title_text, title_usage = await call_llm_async(
             f"Generate a concise academic paper title (under {TITLE_MAX_WORDS} words) "
@@ -1024,6 +1071,8 @@ async def _assemble_tex(shared: dict):
         )
         track_cost(shared, "title:generate", title_usage)
         title = title_text.strip().strip('"').strip("'")
+        if not title or len(title.split()) > TITLE_MAX_WORDS:
+            title = _fallback_title(shared.get("topic", ""))
         shared["paper_title"] = title
 
     tex = (LATEX_SKELETON
@@ -1221,24 +1270,80 @@ class WritingLoop(AsyncNode):
 # ===========================================================================
 # 5. CompileTeX
 # ===========================================================================
+def _contains_cjk(text: str) -> bool:
+    return any("\u4e00" <= ch <= "\u9fff" for ch in text)
+
+
+def _kpsewhich(name: str) -> bool:
+    try:
+        found = subprocess.run(
+            ["kpsewhich", name],
+            capture_output=True, text=True, errors="replace", timeout=10,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return found.returncode == 0 and bool(found.stdout.strip())
+
+
+def _strip_legacy_font_setup(tex: str) -> str:
+    tex = tex.replace("\\usepackage[utf8]{inputenc}\n", "")
+    tex = tex.replace("\\usepackage[T1]{fontenc}\n", "")
+    kept = []
+    for line in tex.splitlines(keepends=True):
+        if line.startswith((
+            "\\usepackage{fontspec}",
+            "\\setmainfont{",
+            "\\setsansfont{",
+            "\\setmonofont{",
+        )):
+            continue
+        kept.append(line)
+    return "".join(kept)
+
+
+def _prepare_latex_engine(tex_path: Path) -> str:
+    """Return pdflatex, or lualatex after making a CJK draft compilable.
+
+    The default skeleton loads inputenc and T1 fontenc, which cannot draw
+    Chinese. When ctex is installed, switch that file to ctex and compile
+    it with lualatex.
+    """
+    tex = tex_path.read_text(encoding="utf-8")
+    if not _contains_cjk(tex):
+        return "pdflatex"
+    if not shutil.which("lualatex") or not _kpsewhich("ctex.sty"):
+        return "pdflatex"
+    tex = _strip_legacy_font_setup(tex)
+    if "ctex" not in tex:
+        tex = tex.replace(
+            "\\documentclass[11pt]{article}\n",
+            "\\documentclass[11pt]{article}\n\\usepackage[fontset=fandol]{ctex}\n",
+            1,
+        )
+    tex_path.write_text(tex, encoding="utf-8")
+    return "lualatex"
+
+
 class CompileTeX(Node):
     def prep(self, shared):
         return shared["output_path"]
 
     def exec(self, out_dir):
-        if not shutil.which("pdflatex"):
-            return None, "pdflatex not found", ""
+        tex_path = Path(out_dir) / "report.tex"
+        engine = _prepare_latex_engine(tex_path) if tex_path.exists() else "pdflatex"
+        if not shutil.which(engine):
+            return None, f"{engine} not found", ""
         all_output = []
         last_pdflatex = ""
-        for cmd in [["pdflatex", "-interaction=nonstopmode", "report.tex"],
+        for cmd in [[engine, "-interaction=nonstopmode", "report.tex"],
                     ["bibtex", "report"],
-                    ["pdflatex", "-interaction=nonstopmode", "report.tex"],
-                    ["pdflatex", "-interaction=nonstopmode", "report.tex"]]:
+                    [engine, "-interaction=nonstopmode", "report.tex"],
+                    [engine, "-interaction=nonstopmode", "report.tex"]]:
             r = subprocess.run(cmd, cwd=out_dir, capture_output=True,
                                text=True, errors="replace", timeout=LATEX_COMPILE_TIMEOUT)
             out = r.stdout + r.stderr
             all_output.append(out)
-            if cmd[0] == "pdflatex":
+            if cmd[0] == engine:
                 last_pdflatex = out
         success = (Path(out_dir) / "report.pdf").exists()
         return success, "\n".join(all_output), last_pdflatex

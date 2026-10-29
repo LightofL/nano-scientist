@@ -7,7 +7,7 @@ import re
 import subprocess
 import yaml
 from pathlib import Path
-from openai import AsyncOpenAI
+from openai import APIConnectionError, APITimeoutError, AsyncOpenAI
 from dotenv import load_dotenv
 
 try:
@@ -17,10 +17,10 @@ except ImportError:
     _TIKTOKEN_AVAILABLE = False
 
 
-_MODEL: str                  = "z-ai/glm-5"
+_MODEL: str                  = "glm-5.3"
 _IN_COST: float              = 0.95
 _OUT_COST: float             = 2.55
-_BASE_URL: str               = "https://openrouter.ai/api/v1"
+_BASE_URL: str               = "https://open.bigmodel.cn/api/coding/paas/v4"
 _EST_AVG_PROMPT_TOKENS: int  = 500
 _EST_AVG_OUTPUT_TOKENS: int  = 300
 _TOOL_DEFAULT_TIMEOUT: int   = 60
@@ -42,10 +42,10 @@ def init_env(env_path: str = None):
     load_dotenv(path, override=True)
     global _MODEL, _IN_COST, _OUT_COST, _BASE_URL, _EST_AVG_PROMPT_TOKENS, _EST_AVG_OUTPUT_TOKENS
     global _TOOL_DEFAULT_TIMEOUT, _TOOL_MAX_TIMEOUT, _TOOL_STDOUT_LIMIT, _TOOL_STDERR_LIMIT
-    _MODEL                 = os.environ.get("MODEL_NAME", "z-ai/glm-5")
+    _MODEL                 = os.environ.get("MODEL_NAME", "glm-5.3")
     _IN_COST               = float(os.environ.get("INPUT_TOKEN_COST_PER_MILLION", "0.95"))
     _OUT_COST              = float(os.environ.get("OUTPUT_TOKEN_COST_PER_MILLION", "2.55"))
-    _BASE_URL              = os.environ.get("INFERENCE_BASE_URL", "https://openrouter.ai/api/v1")
+    _BASE_URL              = os.environ.get("INFERENCE_BASE_URL", "https://open.bigmodel.cn/api/coding/paas/v4")
     _EST_AVG_PROMPT_TOKENS = int(os.environ.get("EST_AVG_PROMPT_TOKENS", "500"))
     _EST_AVG_OUTPUT_TOKENS = int(os.environ.get("EST_AVG_OUTPUT_TOKENS", "300"))
     _TOOL_DEFAULT_TIMEOUT  = int(os.environ.get("TOOL_DEFAULT_TIMEOUT", "60"))
@@ -93,6 +93,14 @@ def count_tokens(text: str) -> int:
     return int(len(text.split()) * 1.3)
 
 
+def _median(values: list[float]) -> float:
+    ordered = sorted(values)
+    mid = len(ordered) // 2
+    if len(ordered) % 2:
+        return ordered[mid]
+    return (ordered[mid - 1] + ordered[mid]) / 2
+
+
 def estimate_calls_remaining(
     budget_remaining: float,
     cost_log: list = None,
@@ -101,18 +109,34 @@ def estimate_calls_remaining(
 ) -> int:
     """Estimate how many LLM calls remain given current budget.
 
-    If cost_log is provided, derives the average cost-per-call from actual
-    observed usage rather than the hardcoded defaults.
+    Observed calls use the median cost. A single multi-round tool skill can
+    be one or two orders of magnitude above a section write or a quality-gate
+    call, and the mean of that mix makes later stages look unaffordable while
+    cash is still left. Explicit token averages are the fallback when no
+    positive observed cost exists.
     """
+    if cost_log:
+        costs = []
+        for entry in cost_log:
+            if entry.get("input_tokens", 0) <= 0:
+                continue
+            cost = float(entry.get("cost") or 0)
+            if cost <= 0:
+                cost = (
+                    entry.get("input_tokens", 0) * _IN_COST / 1_000_000
+                    + entry.get("output_tokens", 0) * _OUT_COST / 1_000_000
+                )
+            if cost > 0:
+                costs.append(cost)
+        if costs:
+            cost_per_call = _median(costs)
+            if cost_per_call <= 0:
+                return 0
+            return max(0, int(budget_remaining / cost_per_call))
     if avg_prompt_tokens is None:
         avg_prompt_tokens = _EST_AVG_PROMPT_TOKENS
     if avg_output_tokens is None:
         avg_output_tokens = _EST_AVG_OUTPUT_TOKENS
-    if cost_log:
-        real_calls = [e for e in cost_log if e.get("input_tokens", 0) > 0]
-        if real_calls:
-            avg_prompt_tokens = int(sum(e["input_tokens"] for e in real_calls) / len(real_calls))
-            avg_output_tokens = int(sum(e["output_tokens"] for e in real_calls) / len(real_calls))
     cost_per_call = (
         avg_prompt_tokens * _IN_COST / 1_000_000
         + avg_output_tokens * _OUT_COST / 1_000_000
@@ -197,10 +221,62 @@ def get_async_client() -> AsyncOpenAI:
             "  OPENROUTER_API_KEY=sk-or-v1-your-key-here\n"
             "Get one at https://openrouter.ai/keys"
         )
+    # SDK default: 2 retries, short backoff capped at 8 seconds.
     return AsyncOpenAI(
         base_url=_BASE_URL,
         api_key=api_key,
     )
+
+
+def _http_status(exc: BaseException):
+    status = getattr(exc, "status_code", None)
+    if status is not None:
+        return status
+    response = getattr(exc, "response", None)
+    return getattr(response, "status_code", None)
+
+
+def _error_body(exc: BaseException) -> dict:
+    body = getattr(exc, "body", None)
+    return body if isinstance(body, dict) else {}
+
+
+def _error_code(exc: BaseException):
+    body = _error_body(exc)
+    err = body.get("error")
+    if isinstance(err, dict) and err.get("code"):
+        return str(err["code"])
+    code = getattr(exc, "code", None)
+    return str(code) if code else None
+
+
+def _retryable_api_error(exc: BaseException) -> bool:
+    """Retry 429s and 5xx. quota_exceeded is included.
+
+    TokenPlan's docs describe that code as an empty wallet. A run also
+    received it while the wallet still had a large balance, then the next
+    small call was a model-channel rate limit. Bounded retries cover that
+    case; a hard quota failure still raises after the last attempt.
+    """
+    code = _error_code(exc)
+    if code in ("rate_limit_exceeded", "quota_exceeded"):
+        return True
+    status = _http_status(exc)
+    if status in (500, 502, 503, 504, 429):
+        return True
+    return isinstance(exc, (APIConnectionError, APITimeoutError))
+
+
+def _rejects_tools(exc: BaseException) -> bool:
+    """True when the endpoint refused the tool schema, not when it rate-limited."""
+    if _retryable_api_error(exc):
+        return False
+    text = str(exc).lower()
+    return "tool" in text or _http_status(exc) == 400
+
+
+async def _chat_completions_create(client: AsyncOpenAI, **kwargs):
+    return await client.chat.completions.create(**kwargs)
 
 
 async def call_llm_async(
@@ -228,10 +304,10 @@ async def call_llm_async(
         kwargs["tool_choice"] = "none"
 
     try:
-        response = await client.chat.completions.create(**kwargs)
+        response = await _chat_completions_create(client, **kwargs)
     except Exception as e:
-        if not allow_tools and ("tool_choice" in str(e).lower() or getattr(getattr(e, "response", None), "status_code", None) == 400):
-            response = await client.chat.completions.create(model=active_model, messages=messages)
+        if not allow_tools and _rejects_tools(e):
+            response = await _chat_completions_create(client, model=active_model, messages=messages)
         else:
             raise
 
@@ -293,14 +369,15 @@ async def call_llm_with_tools_async(
 
     for round_i in range(max_tool_rounds):
         try:
-            response = await client.chat.completions.create(
+            response = await _chat_completions_create(
+                client,
                 model=active_model,
                 messages=messages,
                 tools=all_tools,
                 tool_choice="auto",
             )
         except Exception as e:
-            if "tool" in str(e).lower() or getattr(getattr(e, "response", None), "status_code", None) == 400:
+            if _rejects_tools(e):
                 plain_text, plain_usage = await call_llm_async(prompt, system=system, budget_remaining=budget_remaining, model=active_model)
                 return plain_text, plain_usage
             raise
@@ -569,7 +646,8 @@ def dedup_bibtex(entries: list[str]) -> str:
                 rejected += 1
                 continue
             if key not in seen:
-                seen[key] = entry
+                # Bare & is an alignment tab in LaTeX bibliographies.
+                seen[key] = re.sub(r"(?<!\\)&", r"\\&", entry)
     if rejected:
         print(f"[dedup_bibtex] Rejected {rejected} invalid BibTeX entries")
     return "\n\n".join(seen.values()) + "\n" if seen else ""
